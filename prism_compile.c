@@ -158,6 +158,14 @@ pm_iseq_add_setlocal(rb_iseq_t *iseq, LINK_ANCHOR *const seq, int line, int node
 #define PM_LOCATION_START_LINE_COLUMN(parser, location) \
     pm_newline_list_line_column(&(parser)->newline_list, (location)->start, (parser)->start_line)
 
+/**
+ * Many nodes in Prism can be marked as a static literal, which means slightly
+ * different things depending on which node it is. Occasionally we need to omit
+ * container nodes from static literal checks, which is where this macro comes
+ * in.
+ */
+#define PM_CONTAINER_P(node) (PM_NODE_TYPE_P(node, PM_ARRAY_NODE) || PM_NODE_TYPE_P(node, PM_HASH_NODE) || PM_NODE_TYPE_P(node, PM_RANGE_NODE) || PM_NODE_TYPE_P(node, PM_INTERPOLATED_STRING_NODE))
+
 static int
 pm_node_line_number(const pm_parser_t *parser, const pm_node_t *node)
 {
@@ -787,6 +795,9 @@ pm_static_literal_value(rb_iseq_t *iseq, const pm_node_t *node, const pm_scope_n
         return parse_regexp_concat(iseq, scope_node, (const pm_node_t *) cast, &cast->parts);
       }
       case PM_INTERPOLATED_STRING_NODE: {
+        // Interpolation may be literal ('foo''bar') but all parts still need to be frozen.
+        RUBY_ASSERT(PM_NODE_FLAG_P(node, PM_INTERPOLATED_STRING_NODE_FLAGS_FROZEN));
+
         VALUE string = pm_static_literal_concat(iseq, &((const pm_interpolated_string_node_t *) node)->parts, scope_node, NULL, NULL, false);
         int line_number = pm_node_line_number(scope_node->parser, node);
         return pm_static_literal_string(iseq, string, line_number);
@@ -1407,17 +1418,24 @@ pm_compile_hash_elements(rb_iseq_t *iseq, const pm_node_t *node, const pm_node_l
 
         switch (PM_NODE_TYPE(element)) {
           case PM_ASSOC_NODE: {
+            const pm_assoc_node_t *assoc = (const pm_assoc_node_t *) element;
             // Pre-allocation check (this branch can be omitted).
             if (
                 (shareability == 0) &&
-                PM_NODE_FLAG_P(element, PM_NODE_FLAG_STATIC_LITERAL) && (
+                PM_NODE_FLAG_P(assoc, PM_NODE_FLAG_STATIC_LITERAL) && (
                     (!static_literal && ((index + min_tmp_hash_length) < elements->size)) ||
                     (first_chunk && stack_length == 0)
-                )
+                ) &&
+                !PM_CONTAINER_P(assoc->key) && !PM_CONTAINER_P(assoc->value)
             ) {
                 // Count the elements that are statically-known.
                 size_t count = 1;
-                while (index + count < elements->size && PM_NODE_FLAG_P(elements->nodes[index + count], PM_NODE_FLAG_STATIC_LITERAL)) count++;
+                while (index + count < elements->size) {
+                    assoc = (const pm_assoc_node_t *) elements->nodes[index + count];
+                    if (!PM_NODE_FLAG_P(assoc, PM_NODE_FLAG_STATIC_LITERAL)) break;
+                    if (PM_CONTAINER_P(assoc->key) || PM_CONTAINER_P(assoc->value)) break;
+                    count++;
+                }
 
                 if ((first_chunk && stack_length == 0) || count >= min_tmp_hash_length) {
                     // The subsequence of elements in this hash is long enough
@@ -6107,14 +6125,6 @@ pm_compile_constant_path_operator_write_node(rb_iseq_t *iseq, const pm_constant_
 }
 
 /**
- * Many nodes in Prism can be marked as a static literal, which means slightly
- * different things depending on which node it is. Occasionally we need to omit
- * container nodes from static literal checks, which is where this macro comes
- * in.
- */
-#define PM_CONTAINER_P(node) (PM_NODE_TYPE_P(node, PM_ARRAY_NODE) || PM_NODE_TYPE_P(node, PM_HASH_NODE) || PM_NODE_TYPE_P(node, PM_RANGE_NODE))
-
-/**
  * Compile a scope node, which is a special kind of node that represents a new
  * lexical scope, attached to a node in the AST.
  */
@@ -7094,9 +7104,14 @@ pm_compile_and_node(rb_iseq_t *iseq, const pm_and_node_t *node, const pm_node_lo
 static inline void
 pm_compile_array_node(rb_iseq_t *iseq, const pm_node_t *node, const pm_node_list_t *elements, const pm_node_location_t *location, LINK_ANCHOR *const ret, bool popped, pm_scope_node_t *scope_node)
 {
+    bool contains_container = false;
+    for (size_t index = 0; index < elements->size; index++) {
+        if (PM_CONTAINER_P(elements->nodes[index])) contains_container = true;
+    }
+
     // If every node in the array is static, then we can compile the entire
     // array now instead of later.
-    if (PM_NODE_FLAG_P(node, PM_NODE_FLAG_STATIC_LITERAL)) {
+    if (PM_NODE_FLAG_P(node, PM_NODE_FLAG_STATIC_LITERAL) && !contains_container) {
         // We're only going to compile this node if it's not popped. If it
         // is popped, then we know we don't need to do anything since it's
         // statically known.
@@ -9292,16 +9307,25 @@ pm_compile_node(rb_iseq_t *iseq, const pm_node_t *node, LINK_ANCHOR *const ret, 
         // {}
         // ^^
         //
+        const pm_hash_node_t *cast = (const pm_hash_node_t *) node;
+        const pm_node_list_t *elements = &cast->elements;
+        
+        bool contains_container = false;
+        for (size_t index = 0; index < elements->size; index++) {
+            if (PM_NODE_TYPE_P(elements->nodes[index], PM_ASSOC_NODE)) {
+                const pm_assoc_node_t *cast = (const pm_assoc_node_t *) elements->nodes[index];
+                if (PM_CONTAINER_P(cast->key) || PM_CONTAINER_P(cast->value)) contains_container = true;
+            }
+        }
+
         // If every node in the hash is static, then we can compile the entire
         // hash now instead of later.
-        if (PM_NODE_FLAG_P(node, PM_NODE_FLAG_STATIC_LITERAL)) {
+        if (PM_NODE_FLAG_P(node, PM_NODE_FLAG_STATIC_LITERAL) && !contains_container) {
             // We're only going to compile this node if it's not popped. If it
             // is popped, then we know we don't need to do anything since it's
             // statically known.
             if (!popped) {
-                const pm_hash_node_t *cast = (const pm_hash_node_t *) node;
-
-                if (cast->elements.size == 0) {
+                if (elements->size == 0) {
                     PUSH_INSN1(ret, location, newhash, INT2FIX(0));
                 }
                 else {
@@ -9320,9 +9344,6 @@ pm_compile_node(rb_iseq_t *iseq, const pm_node_t *node, LINK_ANCHOR *const ret, 
             // If this hash is popped, then this serves only to ensure we enact
             // all side-effects (like method calls) that are contained within
             // the hash contents.
-            const pm_hash_node_t *cast = (const pm_hash_node_t *) node;
-            const pm_node_list_t *elements = &cast->elements;
-
             if (popped) {
                 // If this hash is popped, then we can iterate through each
                 // element and compile it. The result of each compilation will
