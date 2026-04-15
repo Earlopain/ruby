@@ -1492,9 +1492,9 @@ Init_vm_backtrace(void)
      *
      *	Running <code>ruby caller_locations.rb</code> will produce:
      *
-     *		caller_locations.rb:2:in `a'
-     *		caller_locations.rb:5:in `b'
-     *		caller_locations.rb:8:in `c'
+     *		caller_locations.rb:2:in 'Object#a'
+     *		caller_locations.rb:5:in 'Object#b'
+     *		caller_locations.rb:8:in 'Object#c'
      *
      *	Here's another example with a slightly different result:
      *
@@ -1512,9 +1512,8 @@ Init_vm_backtrace(void)
      *
      *	Now run <code>ruby foo.rb</code> and you should see:
      *
-     *		init.rb:4:in `initialize'
-     *		init.rb:8:in `new'
-     *		init.rb:8:in `<main>'
+     *		foo.rb:4:in 'Foo#initialize'
+     *		foo.rb:8:in '<main>'
      */
     rb_cBacktraceLocation = rb_define_class_under(rb_cBacktrace, "Location", rb_cObject);
     rb_undef_alloc_func(rb_cBacktraceLocation);
